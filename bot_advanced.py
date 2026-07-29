@@ -37,12 +37,12 @@ EMOJI = {
     "verified": os.getenv("EMOJI_VERIFIED", "✅"),
     "trophy": os.getenv("EMOJI_TROPHY", "🏆"),
     "clock": os.getenv("EMOJI_CLOCK", "⏰"),
-    "skull": os.getenv("EMOJI_SKULL", "💀"),
+    "skull": os.getenv("EMOJI_SKULL", "❌"),
     "grave": os.getenv("EMOJI_GRAVE", "⚰️"),
     "warning": os.getenv("EMOJI_WARNING", "⚠️"),
 }
 
-BRAND_FOOTER = os.getenv("BOT_FOOTER_TEXT", "Instagram Monitor — Premium Monitoring")
+BRAND_FOOTER = os.getenv("BOT_FOOTER_TEXT", "MosviQ Monitoring")
 
 # ============================================================================
 # EMBEDS
