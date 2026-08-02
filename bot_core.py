@@ -547,82 +547,114 @@ async def check_instagram_status(username: str, retries: int = 2) -> CheckResult
 # what the on_status_change / on_verification_change callbacks DO)
 # ============================================================================
 async def run_poll_cycle(on_status_change, on_verification_change=None, track_verification=False):
-    all_data = await load_data()
-    if not all_data:
+    """
+    Only the WORK LIST (which accounts to check) is snapshotted up front.
+    Each account's result is read-modify-written individually right after
+    it's checked, instead of accumulating all updates in memory and
+    overwriting the entire dataset once at the end of the cycle. A full
+    cycle can take minutes for a large watchlist; saving only at the end
+    meant any account added/removed by a user *during* that window got
+    silently discarded when the stale end-of-cycle snapshot was written
+    back. Re-reading fresh data before each individual save closes that
+    window down to a single account's check instead of the whole cycle.
+    """
+    snapshot = await load_data()
+    if not snapshot:
         return
 
-    for user_key, user_accounts in list(all_data.items()):
+    work_items = [
+        (user_key, account_key)
+        for user_key, user_accounts in snapshot.items()
+        for account_key in user_accounts
+    ]
+
+    for user_key, account_key in work_items:
         user_id = int(user_key.split("_")[1])
 
-        for account_key, entry in list(user_accounts.items()):
-            username = entry["username"]
-            delay = INTER_CHECK_DELAY_MS / 1000 + random.uniform(0, 1)
-            await asyncio.sleep(delay)
+        # Re-read fresh right before touching this account, in case it was
+        # added/removed/edited elsewhere since the snapshot was taken.
+        current_data = await load_data()
+        user_accounts = current_data.get(user_key)
+        if user_accounts is None or account_key not in user_accounts:
+            continue  # removed since the snapshot was taken — don't resurrect it
+        entry = user_accounts[account_key]
 
-            case_index = entry.get("case_index", 0)
-            query_variant = generate_case_variant(username, case_index)
-            entry["case_index"] = next_case_index(username, case_index)
+        username = entry["username"]
+        delay = INTER_CHECK_DELAY_MS / 1000 + random.uniform(0, 1)
+        await asyncio.sleep(delay)
 
-            try:
-                result = await check_instagram_status(query_variant)
-            except Exception as e:
-                logger.exception(f"Error checking @{username} (variant '{query_variant}'): {e}")
-                continue
+        case_index = entry.get("case_index", 0)
+        query_variant = generate_case_variant(username, case_index)
+        entry["case_index"] = next_case_index(username, case_index)
 
-            entry["last_checked"] = datetime.now(timezone.utc).isoformat()
-            time_taken_str = compute_time_taken(entry)
+        try:
+            result = await check_instagram_status(query_variant)
+        except Exception as e:
+            logger.exception(f"Error checking @{username} (variant '{query_variant}'): {e}")
+            continue
 
-            if result.status != entry["status"]:
-                if entry.get("pending_status") == result.status:
-                    entry["pending_count"] = entry.get("pending_count", 0) + 1
-                else:
-                    entry["pending_status"] = result.status
-                    entry["pending_count"] = 1
+        entry["last_checked"] = datetime.now(timezone.utc).isoformat()
+        time_taken_str = compute_time_taken(entry)
 
-                if entry["pending_count"] >= CONFIRMATION_THRESHOLD:
-                    old_status = entry["status"]
-                    entry["status"] = result.status
-                    entry["pending_status"] = None
-                    entry["pending_count"] = 0
-                    try:
-                        await on_status_change(user_id, account_key, entry, old_status, result.status, result, time_taken_str)
-                    except Exception:
-                        logger.exception(f"on_status_change handler failed for @{username}")
+        if result.status != entry["status"]:
+            if entry.get("pending_status") == result.status:
+                entry["pending_count"] = entry.get("pending_count", 0) + 1
             else:
+                entry["pending_status"] = result.status
+                entry["pending_count"] = 1
+
+            if entry["pending_count"] >= CONFIRMATION_THRESHOLD:
+                old_status = entry["status"]
+                entry["status"] = result.status
                 entry["pending_status"] = None
                 entry["pending_count"] = 0
+                try:
+                    await on_status_change(user_id, account_key, entry, old_status, result.status, result, time_taken_str)
+                except Exception:
+                    logger.exception(f"on_status_change handler failed for @{username}")
+        else:
+            entry["pending_status"] = None
+            entry["pending_count"] = 0
 
-            if track_verification and result.status == "active":
-                old_verified = bool(entry.get("is_verified", False))
-                new_verified = bool(result.is_verified)
-                verify_watch = bool(entry.get("verify_watch", False))
-                if new_verified != old_verified:
-                    entry["is_verified"] = new_verified
-                    # Alert only fires for accounts explicitly opted into
-                    # verification monitoring (via the dedicated add path) —
-                    # the badge value itself is still tracked/shown for
-                    # every account regardless, just silently.
-                    if verify_watch and on_verification_change:
-                        try:
-                            await on_verification_change(user_id, account_key, entry, old_verified, new_verified, result, time_taken_str)
-                        except Exception:
-                            logger.exception(f"on_verification_change handler failed for @{username}")
-                elif "is_verified" not in entry:
-                    entry["is_verified"] = new_verified
+        if track_verification and result.status == "active":
+            old_verified = bool(entry.get("is_verified", False))
+            new_verified = bool(result.is_verified)
+            verify_watch = bool(entry.get("verify_watch", False))
+            if new_verified != old_verified:
+                entry["is_verified"] = new_verified
+                # Alert only fires for accounts explicitly opted into
+                # verification monitoring (via the dedicated add path) —
+                # the badge value itself is still tracked/shown for
+                # every account regardless, just silently.
+                if verify_watch and on_verification_change:
+                    try:
+                        await on_verification_change(user_id, account_key, entry, old_verified, new_verified, result, time_taken_str)
+                    except Exception:
+                        logger.exception(f"on_verification_change handler failed for @{username}")
+            elif "is_verified" not in entry:
+                entry["is_verified"] = new_verified
 
-            user_accounts[account_key] = entry
-        all_data[user_key] = user_accounts
-
-    await save_data(all_data)
+        # Re-read again right before saving — minimizes (does not fully
+        # eliminate, without true atomic transactions) the chance of
+        # clobbering a change made in the few hundred ms since we last read.
+        save_data_snapshot = await load_data()
+        save_user_accounts = save_data_snapshot.get(user_key)
+        if save_user_accounts is None or account_key not in save_user_accounts:
+            continue  # removed while we were checking it — don't re-add it
+        save_user_accounts[account_key] = entry
+        save_data_snapshot[user_key] = save_user_accounts
+        await save_data(save_data_snapshot)
 
 # ============================================================================
 # NOTIFICATION DELIVERY (DM always + optional per-user configured channel)
 # ============================================================================
 async def notify_user(client: discord.Client, user_id: int, kind: str, embed: discord.Embed,
                        card_path: Optional[str] = None, view: Optional[discord.ui.View] = None) -> None:
-    """DM the user (always gets every alert type), and also post to the
-    channel they've configured for this `kind` ('ban'/'unban'/'verify') via
-    /config, if any — without the personal Remove-account button."""
+    """DM the user (always gets every alert type), post to the channel
+    they've configured for this `kind` ('ban'/'unban'/'verify') via /config
+    if any, and mirror to their linked Telegram chat via /telegram_relay if
+    they've set one up — without the personal Remove-account button on the
+    channel/Telegram copies."""
     try:
         user = await client.fetch_user(user_id)
         if card_path:
@@ -638,23 +670,163 @@ async def notify_user(client: discord.Client, user_id: int, kind: str, embed: di
 
     channels = await get_user_channels(user_id)
     channel_id = channels.get(kind)
-    if not channel_id:
-        return
+    if channel_id:
+        try:
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(channel_id)
+            if card_path:
+                channel_file = discord.File(card_path, filename="card.png")
+                await channel.send(embed=embed, file=channel_file)
+            else:
+                await channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning(f"Cannot post to channel {channel_id} (missing permissions)")
+        except discord.HTTPException as e:
+            logger.error(f"Error posting to channel {channel_id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error posting to notification channel: {e}")
+
+    telegram_cfg = channels.get("telegram")
+    if telegram_cfg and telegram_cfg.get("token") and telegram_cfg.get("chat_id"):
+        caption = discord_embed_to_telegram_html(embed)
+        await send_telegram_relay(telegram_cfg["token"], telegram_cfg["chat_id"], caption, card_path)
+
+# ============================================================================
+# TELEGRAM ALERT RELAY
+#
+# Lets a client mirror every alert this bot sends (whatever kinds this tier
+# supports — ban/unban, or ban/unban/verify) to their own Telegram bot, via
+# Telegram's plain HTTP API. No Telegram bot process needs to run for this —
+# a valid bot token + chat_id is all sendMessage/sendPhoto needs.
+#
+# IMPORTANT: Telegram will not let ANY bot message a user who hasn't first
+# sent that bot a message (e.g. pressed Start). test_telegram_relay() below
+# catches this immediately at setup time instead of failing silently later.
+# ============================================================================
+def discord_embed_to_telegram_html(embed: discord.Embed) -> str:
+    """Best-effort conversion of one of this bot's own embeds (built by
+    build_event_embed) into Telegram HTML. Our embeds are plain text with no
+    Discord markdown, so this is a straightforward reassembly, not a general
+    Discord->Telegram formatter."""
+    lines = []
+    title = embed.title or ""
+    if embed.url:
+        lines.append(f'<a href="{embed.url}"><b>{title}</b></a>')
+    else:
+        lines.append(f"<b>{title}</b>")
+    if embed.description:
+        lines.append("")
+        lines.append(embed.description)
+    if embed.footer and embed.footer.text:
+        lines.append("")
+        lines.append(f"<i>{embed.footer.text}</i>")
+    return "\n".join(lines)
+
+async def send_telegram_relay(token: str, chat_id: str, caption_html: str, card_path: Optional[str] = None) -> None:
+    base = f"https://api.telegram.org/bot{token}"
     try:
-        channel = client.get_channel(channel_id)
-        if channel is None:
-            channel = await client.fetch_channel(channel_id)
-        if card_path:
-            channel_file = discord.File(card_path, filename="card.png")
-            await channel.send(embed=embed, file=channel_file)
-        else:
-            await channel.send(embed=embed)
-    except discord.Forbidden:
-        logger.warning(f"Cannot post to channel {channel_id} (missing permissions)")
-    except discord.HTTPException as e:
-        logger.error(f"Error posting to channel {channel_id}: {e}")
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if card_path:
+                data = aiohttp.FormData()
+                data.add_field("chat_id", str(chat_id))
+                data.add_field("caption", caption_html)
+                data.add_field("parse_mode", "HTML")
+                with open(card_path, "rb") as f:
+                    data.add_field("photo", f, filename="card.png", content_type="image/png")
+                    async with session.post(f"{base}/sendPhoto", data=data) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.error(f"Telegram relay sendPhoto failed ({resp.status}): {body[:200]}")
+            else:
+                payload = {"chat_id": chat_id, "text": caption_html, "parse_mode": "HTML"}
+                async with session.post(f"{base}/sendMessage", json=payload) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(f"Telegram relay sendMessage failed ({resp.status}): {body[:200]}")
     except Exception as e:
-        logger.error(f"Unexpected error posting to notification channel: {e}")
+        logger.error(f"Telegram relay error: {e}")
+
+async def test_telegram_relay(token: str, chat_id: str):
+    """Validates the token and confirms the bot can actually message this
+    chat_id, before saving anything. Returns (ok: bool, error_message: str)."""
+    base = f"https://api.telegram.org/bot{token}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{base}/getMe") as resp:
+                if resp.status != 200:
+                    return False, "That doesn't look like a valid bot token."
+
+            payload = {
+                "chat_id": chat_id,
+                "text": "✅ This Telegram chat is now linked to your Instagram Monitor alerts.",
+                "parse_mode": "HTML",
+            }
+            async with session.post(f"{base}/sendMessage", json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return False, (
+                        "Couldn't send a message to that chat ID. Make sure you've sent "
+                        "your bot a /start message first, and that the chat ID is correct. "
+                        f"(Telegram said: {body[:150]})"
+                    )
+    except Exception as e:
+        return False, str(e)
+    return True, ""
+
+async def set_user_telegram(user_id: int, token: Optional[str], chat_id: Optional[str]) -> None:
+    async with _channel_lock:
+        data = await _redis_get_json(CHANNEL_CONFIG_REDIS_KEY) if USE_REDIS else _load_channel_config_file()
+        user_key = get_user_key(user_id)
+        if user_key not in data:
+            data[user_key] = {}
+        if not token or not chat_id:
+            data[user_key].pop("telegram", None)
+        else:
+            data[user_key]["telegram"] = {"token": token, "chat_id": chat_id}
+        if USE_REDIS:
+            await _redis_set_json(CHANNEL_CONFIG_REDIS_KEY, data)
+        else:
+            _save_channel_config_file(data)
+
+class TelegramRelayModal(discord.ui.Modal):
+    """Modal (private popup, not a visible chat message) so the bot token
+    never appears as plaintext in a channel — unlike a slash command option,
+    which Discord shows in the invocation itself."""
+    def __init__(self):
+        super().__init__(title="Telegram Alert Relay")
+        self.token_input = discord.ui.TextInput(
+            label="Telegram Bot Token (from @BotFather)",
+            placeholder="123456789:AAExampleTokenGoesHere",
+            max_length=100,
+        )
+        self.chat_id_input = discord.ui.TextInput(
+            label="Your Telegram Chat/User ID",
+            placeholder="e.g. 123456789 — get it from @userinfobot",
+            max_length=32,
+        )
+        self.add_item(self.token_input)
+        self.add_item(self.chat_id_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        token = self.token_input.value.strip()
+        chat_id = self.chat_id_input.value.strip()
+        ok, error = await test_telegram_relay(token, chat_id)
+        if not ok:
+            await interaction.followup.send(f"⚠️ {error}", ephemeral=True)
+            return
+        await set_user_telegram(interaction.user.id, token, chat_id)
+        await interaction.followup.send(
+            "✅ Telegram relay is active — every alert this bot sends you will now also go to that Telegram chat.",
+            ephemeral=True,
+        )
+
+async def disable_telegram_relay(interaction: discord.Interaction):
+    await set_user_telegram(interaction.user.id, None, None)
+    await interaction.response.send_message("✅ Telegram relay disabled.", ephemeral=True)
 
 # ============================================================================
 # /config — per-user channel picker (shared by both bots; each bot decides
